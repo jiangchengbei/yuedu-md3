@@ -483,40 +483,46 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
         if (preloadJob?.isActive == true) return
         preloadJob = lifecycleScope.launch(Dispatchers.IO) {
             val book = ReadBook.book ?: return@launch
-            val nextIdx = ReadBook.durChapterIndex + 1
-            val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, nextIdx)
-                ?: return@launch
-            val rawContent = BookHelp.getContent(book, chapter) ?: return@launch
+            val currentIdx = ReadBook.durChapterIndex
+            val limit = AppConfig.audioPreDownloadNum
 
-            val contentProcessor = ContentProcessor.get(book)
-            val bookContent = contentProcessor.getContent(
-                book = book,
-                chapter = chapter,
-                content = rawContent,
-                includeTitle = true,
-                useReplace = AppConfig.replaceEnableDefault && book.getUseReplaceRule(),
-                chineseConvert = AppConfig.chineseConverterType != 0,
-                reSegment = book.getReSegment()
-            )
-
-            val segments = bookContent.toString()
-                .split("\n")
-                .filter { it.isNotEmpty() }
-
-            if (segments.isEmpty()) return@launch
-
-            val limit = 50.coerceAtMost(segments.size)
-
-            for (i in 0 until limit) {
+            for (offset in 1..limit) {
                 ensureActive()
-                val text = segments[i]
-                if (text.matches(AppPattern.notReadAloudRegex)) continue
+                val targetIdx = currentIdx + offset
+                val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, targetIdx)
+                    ?: break
+                val rawContent = BookHelp.getContent(book, chapter) ?: continue
 
-                val cacheFile = getCacheFileForText(text, i, chapter.title)
-                if (cacheFile.exists() && cacheFile.length() > 0) continue
+                val contentProcessor = ContentProcessor.get(book)
+                val bookContent = contentProcessor.getContent(
+                    book = book,
+                    chapter = chapter,
+                    content = rawContent,
+                    includeTitle = true,
+                    useReplace = AppConfig.replaceEnableDefault && book.getUseReplaceRule(),
+                    chineseConvert = AppConfig.chineseConverterType != 0,
+                    reSegment = book.getReSegment()
+                )
 
-                val utteranceId = "PRELOAD_${AppConst.APP_TAG}_${System.currentTimeMillis()}_$i"
-                synthesizeText(text, utteranceId, i, chapter.title)
+                val segments = bookContent.toString()
+                    .split("\n")
+                    .filter { it.isNotEmpty() }
+
+                if (segments.isEmpty()) continue
+
+                val segLimit = 50.coerceAtMost(segments.size)
+
+                for (i in 0 until segLimit) {
+                    ensureActive()
+                    val text = segments[i]
+                    if (text.matches(AppPattern.notReadAloudRegex)) continue
+
+                    val cacheFile = getCacheFileForText(text, i, chapter.title)
+                    if (cacheFile.exists() && cacheFile.length() > 0) continue
+
+                    val utteranceId = "PRELOAD_${AppConst.APP_TAG}_${System.currentTimeMillis()}_$i"
+                    synthesizeText(text, utteranceId, i, chapter.title)
+                }
             }
         }
     }

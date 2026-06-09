@@ -35,6 +35,7 @@ import io.legado.app.data.entities.BookChapter
 import io.legado.app.data.entities.HttpTTS
 import io.legado.app.exception.NoStackTraceException
 import io.legado.app.help.book.BookHelp
+import io.legado.app.help.book.ContentProcessor
 import io.legado.app.help.config.AppConfig
 import io.legado.app.help.coroutine.Coroutine
 import io.legado.app.help.exoplayer.InputStreamDataSource
@@ -204,11 +205,6 @@ class HttpReadAloudService : BaseReadAloudService(),
         }
     }
 
-    // 辅助方法：确保能读到文件
-    private fun getChapterContent(book: Book, chapter: BookChapter): String? {
-        return BookHelp.getContent(book, chapter)
-    }
-
     private suspend fun preDownloadAudios(httpTts: HttpTTS) {
         val book = ReadBook.book ?: return
         val currentIdx = ReadBook.durChapterIndex
@@ -221,11 +217,21 @@ class HttpReadAloudService : BaseReadAloudService(),
                 val targetIndex = currentIdx + i
                 val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, targetIndex) ?: break
 
-                // 1. 获取内容
-                val contentString = getChapterContent(book, chapter)
-                if (contentString.isNullOrEmpty()) continue // 内容没下载，跳过
-
-                val contentList = contentString.split("\n").filter { it.isNotEmpty() }
+                // 1. 获取并处理内容（与播放路径保持一致，确保缓存命中）
+                val rawContent = BookHelp.getContent(book, chapter) ?: continue
+                val contentProcessor = ContentProcessor.get(book)
+                val bookContent = contentProcessor.getContent(
+                    book = book,
+                    chapter = chapter,
+                    content = rawContent,
+                    includeTitle = true,
+                    useReplace = AppConfig.replaceEnableDefault && book.getUseReplaceRule(),
+                    chineseConvert = AppConfig.chineseConverterType != 0,
+                    reSegment = book.getReSegment()
+                )
+                val contentList = bookContent.toString()
+                    .split("\n")
+                    .filter { it.isNotEmpty() }
 
                 contentList.forEach { content ->
                     currentCoroutineContext().ensureActive()
@@ -321,10 +327,21 @@ class HttpReadAloudService : BaseReadAloudService(),
                 val targetIndex = currentIdx + i
                 val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, targetIndex) ?: break
                 
-                val contentString = getChapterContent(book, chapter)
-                if (contentString.isNullOrEmpty()) continue
-
-                val contentList = contentString.split("\n").filter { it.isNotEmpty() }
+                // 获取并处理内容（与播放路径保持一致，确保缓存命中）
+                val rawContent = BookHelp.getContent(book, chapter) ?: continue
+                val contentProcessor = ContentProcessor.get(book)
+                val bookContent = contentProcessor.getContent(
+                    book = book,
+                    chapter = chapter,
+                    content = rawContent,
+                    includeTitle = true,
+                    useReplace = AppConfig.replaceEnableDefault && book.getUseReplaceRule(),
+                    chineseConvert = AppConfig.chineseConverterType != 0,
+                    reSegment = book.getReSegment()
+                )
+                val contentList = bookContent.toString()
+                    .split("\n")
+                    .filter { it.isNotEmpty() }
                 
                 contentList.forEach { content ->
                     currentCoroutineContext().ensureActive()
