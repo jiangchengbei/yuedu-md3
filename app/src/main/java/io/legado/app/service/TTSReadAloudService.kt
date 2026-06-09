@@ -32,7 +32,6 @@ import io.legado.app.utils.MD5Utils
 import io.legado.app.utils.fromJsonObject
 import io.legado.app.utils.servicePendingIntent
 import io.legado.app.utils.toastOnUi
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -88,8 +87,6 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
     private var synthesisTask: Job? = null
     /** 跨章预加载协程 */
     private var preloadJob: Job? = null
-    /** 防并发合成相同文件的锁 */
-    private val synthesisLocks = ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
     /** 防止 STATE_ENDED 和 onMediaItemTransition 双重触发 updateNextPos */
     private var skipNextEndedUpdate = false
 
@@ -210,13 +207,7 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
 
         val tts = textToSpeech ?: return null
 
-        val lock = synthesisLocks.getOrPut(cacheFile.absolutePath) { kotlinx.coroutines.sync.Mutex() }
-        lock.withLock {
-            if (cacheFile.exists() && cacheFile.length() > 0 && isValidAudioFile(cacheFile)) {
-                return cacheFile
-            }
-
-            suspend fun tryOnce(attempt: Int): File? {
+        suspend fun tryOnce(attempt: Int): File? {
             val currentUtteranceId = if (attempt == 0) utteranceId else "${utteranceId}_retry$attempt"
             val tempFile = File(ttsFolderPath, "${cacheFile.name}.${currentUtteranceId}.tmp")
 
@@ -269,12 +260,11 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
             }
         }
 
-            repeat(3) { attempt ->
-                val result = tryOnce(attempt)
-                if (result != null) return@withLock result
-            }
-            return@withLock null
+        repeat(3) { attempt ->
+            val result = tryOnce(attempt)
+            if (result != null) return result
         }
+        return null
     }
 
     private suspend fun synthesizeSingle(index: Int): File? {
