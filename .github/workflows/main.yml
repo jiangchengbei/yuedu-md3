@@ -3,21 +3,21 @@ name: 自动打包 Android APK
 # 什么时候触发打包？
 on:
   push:
-    branches: [ "main", "master" ] # 当你往 main 或 master 分支推送代码时
-  workflow_dispatch: # 允许你在网页上手动点击按钮触发打包
+    branches: [ "main", "master" ] 
+  workflow_dispatch: 
 
 jobs:
   build:
-    runs-on: ubuntu-latest # 使用最新版的 Ubuntu Linux 系统作为云电脑
+    runs-on: ubuntu-latest 
 
     steps:
     - name: 1. 下载代码到云电脑
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4 # 【已修复】更新为 v4
 
     - name: 2. 配置 Java 环境 (JDK 17)
-      uses: actions/setup-java@v3
+      uses: actions/setup-java@v4 # 【已修复】更新为 v4
       with:
-        java-version: '17' # 目前大多数新安卓项目用 17，如果报错可以后续改成 11
+        java-version: '17' 
         distribution: 'temurin'
 
     - name: 3. 给 Gradle 编译工具运行权限
@@ -27,7 +27,7 @@ jobs:
       run: ./gradlew assembleDebug
 
     - name: 5. 提取并上传 APK 文件
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4 # 【已修复】关键：更新为 v4
       with:
-        name: 阅读MD3-测试版APK # 最终下载时的压缩包名字
-        path: app/build/outputs/apk/debug/*.apk # 这是安卓默认生成 APK 的路径
+        name: 阅读MD3-测试版APK 
+        path: app/build/outputs/apk/debug/*.apk
