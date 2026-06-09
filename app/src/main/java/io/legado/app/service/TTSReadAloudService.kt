@@ -32,6 +32,7 @@ import io.legado.app.utils.MD5Utils
 import io.legado.app.utils.fromJsonObject
 import io.legado.app.utils.servicePendingIntent
 import io.legado.app.utils.toastOnUi
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -60,6 +61,8 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
     // ====== TTS 核心 ======
     private var textToSpeech: TextToSpeech? = null
     private var ttsInitFinish = false
+    /** 初始化后锁定的TTS引擎标识，用于缓存键，不随运行时语音切换变化 */
+    private var ttsEngineKey: String = "default"
     /** 标记主线程已经请求播放但 TTS 尚未初始化完成，onInit 回调中据此补救调用 play() */
     private var pendingPlay = false
 
@@ -85,6 +88,10 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
     private var synthesisTask: Job? = null
     /** 跨章预加载协程 */
     private var preloadJob: Job? = null
+    /** 防并发合成相同文件的锁 */
+    private val synthesisLocks = ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
+    /** 防止 STATE_ENDED 和 onMediaItemTransition 双重触发 updateNextPos */
+    private var skipNextEndedUpdate = false
 
     // ====== 生命周期 ======
 
@@ -111,6 +118,7 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
         ttsInitFinish = false
         val engine = GSON.fromJsonObject<SelectItem<String>>(ReadAloud.ttsEngine).getOrNull()?.value
         LogUtils.d(TAG, "initTts engine:$engine")
+        ttsEngineKey = engine ?: "default"
         textToSpeech = if (engine.isNullOrBlank()) {
             TextToSpeech(this, this)
         } else {
@@ -202,7 +210,13 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
 
         val tts = textToSpeech ?: return null
 
-        suspend fun tryOnce(attempt: Int): File? {
+        val lock = synthesisLocks.getOrPut(cacheFile.absolutePath) { kotlinx.coroutines.sync.Mutex() }
+        lock.withLock {
+            if (cacheFile.exists() && cacheFile.length() > 0 && isValidAudioFile(cacheFile)) {
+                return cacheFile
+            }
+
+            suspend fun tryOnce(attempt: Int): File? {
             val currentUtteranceId = if (attempt == 0) utteranceId else "${utteranceId}_retry$attempt"
             val tempFile = File(ttsFolderPath, "${cacheFile.name}.${currentUtteranceId}.tmp")
 
@@ -255,11 +269,12 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
             }
         }
 
-        repeat(3) { attempt ->
-            val result = tryOnce(attempt)
-            if (result != null) return result
+            repeat(3) { attempt ->
+                val result = tryOnce(attempt)
+                if (result != null) return@withLock result
+            }
+            return@withLock null
         }
-        return null
     }
 
     private suspend fun synthesizeSingle(index: Int): File? {
@@ -387,7 +402,10 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
             Player.STATE_ENDED -> {
                 playIndexJob?.cancel()
                 playErrorNo = 0
-                updateNextPos()
+                if (!skipNextEndedUpdate) {
+                    updateNextPos()
+                }
+                skipNextEndedUpdate = false
                 exoPlayer.stop()
                 exoPlayer.clearMediaItems()
             }
@@ -412,6 +430,7 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
             playErrorNo = 0
         }
         if (mediaItem != null) {
+            skipNextEndedUpdate = true
             updateNextPos()
         }
         upPlayPos()
@@ -488,40 +507,48 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
 
             for (offset in 1..limit) {
                 ensureActive()
-                val targetIdx = currentIdx + offset
-                val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, targetIdx)
-                    ?: break
-                val rawContent = BookHelp.getContent(book, chapter) ?: continue
+                try {
+                    val targetIdx = currentIdx + offset
+                    val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, targetIdx)
+                        ?: continue
+                    val rawContent = BookHelp.getContent(book, chapter) ?: continue
 
-                val contentProcessor = ContentProcessor.get(book)
-                val bookContent = contentProcessor.getContent(
-                    book = book,
-                    chapter = chapter,
-                    content = rawContent,
-                    includeTitle = true,
-                    useReplace = AppConfig.replaceEnableDefault && book.getUseReplaceRule(),
-                    chineseConvert = AppConfig.chineseConverterType != 0,
-                    reSegment = book.getReSegment()
-                )
+                    val contentProcessor = ContentProcessor.get(book)
+                    val bookContent = contentProcessor.getContent(
+                        book = book,
+                        chapter = chapter,
+                        content = rawContent,
+                        includeTitle = true,
+                        useReplace = AppConfig.replaceEnableDefault && book.getUseReplaceRule(),
+                        chineseConvert = AppConfig.chineseConverterType != 0,
+                        reSegment = book.getReSegment()
+                    )
 
-                val segments = bookContent.toString()
-                    .split("\n")
-                    .filter { it.isNotEmpty() }
+                    val segments = bookContent.toString()
+                        .split("\n")
+                        .filter { it.isNotEmpty() }
 
-                if (segments.isEmpty()) continue
+                    if (segments.isEmpty()) continue
 
-                val segLimit = 50.coerceAtMost(segments.size)
+                    val segLimit = 50.coerceAtMost(segments.size)
 
-                for (i in 0 until segLimit) {
-                    ensureActive()
-                    val text = segments[i]
-                    if (text.matches(AppPattern.notReadAloudRegex)) continue
+                    for (i in 0 until segLimit) {
+                        ensureActive()
+                        val text = segments[i]
+                        if (text.matches(AppPattern.notReadAloudRegex)) continue
 
-                    val cacheFile = getCacheFileForText(text, i, chapter.title)
-                    if (cacheFile.exists() && cacheFile.length() > 0) continue
+                        val cacheFile = getCacheFileForText(text, i, chapter.title)
+                        if (cacheFile.exists() && cacheFile.length() > 0) continue
 
-                    val utteranceId = "PRELOAD_${AppConst.APP_TAG}_${System.currentTimeMillis()}_$i"
-                    synthesizeText(text, utteranceId, i, chapter.title)
+                        val utteranceId = "PRELOAD_${AppConst.APP_TAG}_${System.currentTimeMillis()}_$i"
+                        runCatching {
+                            synthesizeText(text, utteranceId, i, chapter.title)
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    AppLog.put("预加载章节失败, offset=$offset", e)
                 }
             }
         }
@@ -572,9 +599,9 @@ class TTSReadAloudService : BaseReadAloudService(), TextToSpeech.OnInitListener,
     private fun getCacheFileForText(text: String, index: Int = -1, chapterTitle: String = ""): File {
         val engine = ReadAloud.ttsEngine ?: "default"
         val rate = AppConfig.speechRateFloat
-        val voice = textToSpeech?.voice?.name ?: "default"
+        val engKey = ttsEngineKey
         val indexPart = if (index >= 0) "|$index" else ""
-        val key = MD5Utils.md5Encode16("$engine|$voice|$rate$indexPart|$text")
+        val key = MD5Utils.md5Encode16("$engine|$engKey|$rate$indexPart|$text")
         val titlePart = if (chapterTitle.isNotEmpty()) MD5Utils.md5Encode16(chapterTitle.trim()) + "_" else ""
         return File(ttsFolderPath, "$titlePart$key.mp3")
     }
